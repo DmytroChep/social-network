@@ -1,0 +1,281 @@
+import { Server as SocketServer } from "socket.io";
+import { socketAuthMiddleware } from "../middlewares/socket-auth-middleware";
+import { ChatService } from "../Chat/Chat.service";
+import { parseIdToBigInt, ensureBigInt, sanitizeBigInts } from "../bigints";
+import type {
+    AuthenticatedSocket,
+    SocketManagerContract,
+} from "./socket.types";
+
+const normalizeChatId = (value: unknown) => parseIdToBigInt(value as any);
+
+const ok = <T>(data?: T) => ({ status: "ok" as const, data });
+const fail = (message: string) => ({ status: "error" as const, message });
+const onlineUsers = new Set<number>();
+
+export const SocketManager: SocketManagerContract = {
+    socketServer: null,
+
+    initSocketServer(httpServer) {
+        this.socketServer = new SocketServer(httpServer, {
+            maxHttpBufferSize: 20 * 1024 * 1024,
+            cors: {
+                origin: "*",
+            },
+        });
+
+        const io = this.socketServer;
+
+        const emitChatUpdated = async (chatId: bigint, userIds?: Array<number | bigint>) => {
+            if (!io) return;
+            const participants = userIds
+                ? userIds.map((user_id) => ({ user_id }))
+                : await ChatService.getChatParticipants(chatId);
+
+            await Promise.all(
+                participants.map(async (participant) => {
+                    const uid = typeof participant.user_id === "bigint"
+                        ? participant.user_id
+                        : BigInt(participant.user_id as any);
+                    const chat = await ChatService.getChatById(
+                        chatId,
+                        uid,
+                    );
+                    io.to(`user-${String(uid)}`).emit("chat:updated", sanitizeBigInts(chat));
+                }),
+            );
+        };
+
+        // Настройка основного сокета
+        this.socketServer.use(socketAuthMiddleware);
+
+        this.socketServer.on("connection", (socket: AuthenticatedSocket) => {
+            if (!io) return;
+
+            socket.join(`user-${socket.data.userId}`);
+            const userId = Number(socket.data.userId);
+
+            onlineUsers.add(userId);
+
+            // Оповещаем остальных, что этот пользователь онлайн
+            socket.broadcast.emit("user:online", { id: userId });
+
+            // Отправляем этому пользователю список уже онлайн
+            socket.emit("users:initial_online", Array.from(onlineUsers));
+
+            // Сообщаем Django bridge один раз
+            this.socketServer?.of("/django-bridge").emit("server_event", {
+                type: "user:online",
+                id: userId,
+            });
+
+            const joinChat = async (
+                data: { chatId?: number | string },
+                ack?: (response: ReturnType<typeof ok> | ReturnType<typeof fail>) => void,
+            ) => {
+                const chatId = normalizeChatId(data?.chatId);
+                if (!chatId) {
+                    ack?.(fail("invalid chat id"));
+                    return;
+                }
+
+                const isParticipant = await ChatService.isUserChatParticipant(
+                    chatId,
+                    socket.data.userId,
+                );
+                if (!isParticipant) {
+                    ack?.(fail("you are not chat participant"));
+                    return;
+                }
+
+                socket.join(`chat-${chatId}`);
+                ack?.(ok());
+            };
+
+            const leaveChat = (data: { chatId?: number | string }) => {
+                const chatId = normalizeChatId(data?.chatId);
+                if (chatId) socket.leave(`chat-${chatId}`);
+            };
+
+            socket.on("chat:join", joinChat);
+            socket.on("joinChat", joinChat);
+            socket.on("chat:leave", leaveChat);
+            socket.on("leaveChat", leaveChat);
+
+            socket.on("messages:read", async (data, ack) => {
+                try {
+                    const chatId = normalizeChatId(data?.chatId);
+                    if (!chatId) { ack?.(fail("invalid chat id")); return; }
+
+                    const isParticipant = await ChatService.isUserChatParticipant(chatId, socket.data.userId);
+                    if (!isParticipant) { ack?.(fail("you are not chat participant")); return; }
+
+                    const readCount = await ChatService.markMessagesAsRead(chatId, socket.data.userId);
+
+                    io.to(`chat-${String(chatId)}`).emit("messages:read", {
+                        chatId: String(chatId),
+                        readerId: String(socket.data.userId),
+                    });
+
+                    this.socketServer?.of("/django-bridge").emit("server_event", {
+                        type: "messages:read",
+                        chatId: String(chatId),
+                        readerId: String(socket.data.userId),
+                    });
+
+                    emitChatUpdated(chatId, [socket.data.userId]).catch((err) => console.error(err));
+
+                    ack?.(ok({ readCount }));
+                } catch (error) {
+                    console.error("messages:read error", error);
+                    ack?.(fail("unknown error"));
+                }
+            });
+
+            socket.on(
+                "message:send",
+                async (
+                    data: { chatId?: number | string; text?: string; images?: string[] },
+                    ack?: (response: ReturnType<typeof ok> | ReturnType<typeof fail>) => void,
+                ) => {
+                    try {
+                        const chatId = normalizeChatId(data?.chatId);
+                        if (!chatId) {
+                            ack?.(fail("invalid chat id"));
+                            return;
+                        }
+
+                        const message = await ChatService.sendMessage(
+                            socket.data.userId,
+                            chatId,
+                            data?.text ?? "",
+                            data?.images ?? [],
+                        );
+
+                        // handle send result/error first
+                        if (typeof message === "string") {
+                            ack?.(fail(message));
+                            return;
+                        }
+
+                        // ensure we have fully populated message (images/urls) before emit
+                        let emittedMessage: any = message;
+
+                        // If ChatService provides a getter to fetch message with relations, use it
+                        if (message && typeof (ChatService as any).getMessageById === "function") {
+                            try {
+                                const maybe = await (ChatService as any).getMessageById(message.id);
+                                if (maybe) emittedMessage = maybe;
+                            } catch (err) {
+                                console.warn("Failed to re-fetch message for emit:", err);
+                                // fallback to original `message`
+                            }
+                        }
+
+                        const safeMessage = sanitizeBigInts(emittedMessage);
+
+                        // Emit to chat room
+                        io.to(`chat-${String(chatId)}`).emit("message:new", {
+                            chatId: String(chatId),
+                            message: safeMessage,
+                        });
+
+                        // Also emit to each participant's personal room to ensure delivery to all devices
+                        try {
+                            const participants = await ChatService.getChatParticipants(chatId);
+                            await Promise.all(
+                                participants.map(async (participant) => {
+                                    const uid = typeof participant.user_id === "bigint"
+                                        ? participant.user_id
+                                        : BigInt(participant.user_id as any);
+                                    io.to(`user-${String(uid)}`).emit("message:new", {
+                                        chatId: String(chatId),
+                                        message: safeMessage,
+                                    });
+                                }),
+                            );
+                        } catch (err) {
+                            console.error("Failed to emit to participant user rooms:", err);
+                        }
+
+                        // Inform Django bridge once
+                        this.socketServer?.of("/django-bridge").emit("server_event", {
+                            type: "message:new",
+                            chatId: String(chatId),
+                            message: safeMessage,
+                        });
+
+                        // Background update of chats/counts (unchanged)
+                        emitChatUpdated(chatId).catch((err) => console.error("⚠️ Ошибка обновления чатов в фоне:", err));
+
+                        ack?.(ok(safeMessage));
+                    } catch (error) {
+                        console.error("message:send error", error);
+                        ack?.(fail("unknown error"));
+                    }
+                },
+            );
+
+            socket.on("disconnect", () => {
+                onlineUsers.delete(userId);
+                io.emit("user:offline", { id: userId });
+
+                this.socketServer?.of("/django-bridge").emit("server_event", {
+                    type: "user:offline",
+                    id: userId,
+                });
+            });
+        }); // Конец основного сокета
+
+        // Django bridge — отдельный неймспект без auth middleware
+        const djangoBridge = this.socketServer.of("/django-bridge");
+
+        djangoBridge.on("connection", (socket) => {
+            console.log("✅ Django підключився:", socket.id);
+
+            socket.on("django_event", async (data: { type: string; chatId?: string; message?: unknown; userId?: number | string }) => {
+                console.log("📨 Подія від Django:", data);
+
+                // --- ОБРАБОТКА ОНЛАЙНА ИЗ ДЖАНГО ---
+                if (data.type === "user:online" && data.userId) {
+                    const uid = Number(data.userId);
+                    onlineUsers.add(uid);
+                    io?.emit("user:online", { id: uid });
+                    return; // Выходим, так как код ниже предназначен только для сообщений
+                }
+
+                if (data.type === "user:offline" && data.userId) {
+                    const uid = Number(data.userId);
+                    onlineUsers.delete(uid);
+                    io?.emit("user:offline", { id: uid });
+                    return;
+                }
+
+                if (data.type === "message:new" && data.chatId) {
+                    // 1. Отправляем тем, у кого чат открыт
+                    this.socketServer?.to(`chat-${data.chatId}`).emit("message:new", {
+                        chatId: data.chatId,
+                        message: data.message,
+                    });
+
+                    // 2. Now call emitChatUpdated in background
+                    try {
+                        const numericChatId = parseIdToBigInt(data.chatId);
+                        await emitChatUpdated(numericChatId);
+                    } catch (error) {
+                        console.error("❌ Ошибка обновления счетчиков для неактивных пользователей:", error);
+                    }
+                }
+            });
+
+            socket.on("disconnect", () => {
+                console.log("❌ Django відключився");
+            });
+
+            socket.on("users:get_online", (ack) => {
+                ack?.(ok(Array.from(onlineUsers)));
+            });
+        });
+
+    },
+};
